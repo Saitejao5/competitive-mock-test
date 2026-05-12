@@ -1,0 +1,90 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * { box-sizing: border-box; }
+
+  html, body, #root {
+    @apply h-full;
+    background-color: #07070d;
+    color: #e8e8f0;
+    font-family: 'DM Sans', sans-serif;
+  }
+
+  ::-webkit-scrollbar { width: 4px; height: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #32325a; border-radius: 2px; }
+  ::-webkit-scrollbar-thumb:hover { background: #7c5cfc44; }
+
+  ::selection { background: rgba(124, 92, 252, 0.3); }
+}
+
+@layer components {
+  .glass {
+    background: rgba(19, 19, 31, 0.8);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+  }
+
+  .glass-hover {
+    @apply glass transition-all duration-200;
+  }
+  .glass-hover:hover {
+    border-color: rgba(124, 92, 252, 0.25);
+    background: rgba(26, 26, 46, 0.9);
+  }
+
+  .shimmer-box {
+    background: linear-gradient(90deg, #13131f 25%, #1a1a2e 50%, #13131f 75%);
+    background-size: 400px 100%;
+    animation: shimmer 1.6s infinite;
+    border-radius: 8px;
+  }
+
+  .glow-violet { box-shadow: 0 0 24px rgba(124, 92, 252, 0.25); }
+  .glow-emerald { box-shadow: 0 0 24px rgba(45, 217, 138, 0.2); }
+
+  .btn-primary {
+    @apply px-6 py-3 rounded-xl font-display font-semibold text-white transition-all duration-200;
+    background: linear-gradient(135deg, #7c5cfc, #5c3dfc);
+  }
+  .btn-primary:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 8px 24px rgba(124, 92, 252, 0.4);
+  }
+  .btn-primary:active { transform: translateY(0); }
+
+  .btn-ghost {
+    @apply px-5 py-2.5 rounded-xl font-body font-medium transition-all duration-200;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: #9090b0;
+  }
+  .btn-ghost:hover {
+    border-color: rgba(124, 92, 252, 0.4);
+    color: #e8e8f0;
+    background: rgba(124, 92, 252, 0.08);
+  }
+
+  .tag {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-mono;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.04);
+    color: #7070a0;
+  }
+
+  .section-dot {
+    @apply w-2 h-2 rounded-full;
+  }
+}
+
+/* Noise overlay for depth */
+.noise::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.03'/%3E%3C/svg%3E");
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.4;
+}
