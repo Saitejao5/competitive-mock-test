@@ -76,7 +76,7 @@ EXAM DETAILS:
 QUESTION QUALITY RULES:
 1. Match EXACTLY the difficulty level: ${difficulty === 'Easy' ? 'Simple, direct, beginner-friendly' : difficulty === 'Medium' ? 'Moderate complexity, requires understanding' : difficulty === 'Hard' ? 'Complex, multi-step reasoning required' : 'Exact real exam difficulty, time-pressured'}
 2. Cover diverse sub-topics within ${sectionName} — no sub-topic repeated more than twice
-3. All questions must be solvable within 60-90 seconds each
+3. each section must have exact 25 quations for each section
 4. Options must be plausible — no obviously wrong choices
 5. Explanations must be clear and educational
 

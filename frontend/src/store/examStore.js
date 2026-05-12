@@ -1,17 +1,31 @@
 import { create } from 'zustand';
 
 export const useExamStore = create((set, get) => ({
-  // ── Page ──────────────────────────────────────────────
-  page: 'home', // 'home' | 'exam' | 'analysis'
+  // ── NAVIGATION ────────────────────────────────────────
+  // page: 'landing' | 'board-explorer' | 'exam-config' | 'tier-select' | 'practice-mode' | 'exam' | 'analytics'
+  page: 'landing',
   setPage: (page) => set({ page }),
 
-  // ── Config ────────────────────────────────────────────
+  // ── BREADCRUMB STATE ──────────────────────────────────
+  navigation: {
+    selectedBoard: null,      // 'ssc', 'rrb', 'ibps', 'upsc', 'nta'
+    selectedExam: null,       // 'ssc-cgl', 'rrb-ntpc', etc.
+    selectedTier: null,       // 'tier-1', 'tier-2', etc.
+    selectedPracticeMode: null // 'exam' | 'topic' | 'paper'
+  },
+  setNavigation: (patch) => set(s => ({ navigation: { ...s.navigation, ...patch } })),
+  clearNavigation: () => set({ navigation: { selectedBoard: null, selectedExam: null, selectedTier: null, selectedPracticeMode: null } }),
+
+  // ── EXAM CONFIGURATION ────────────────────────────────
   config: {
     mode: 'exam',
     exam: 'SSC CGL',
     difficulty: 'Medium',
     qPerSection: 5,
-    sections: ['Reasoning', 'Quantitative Aptitude', 'English Language', 'General Knowledge']
+    sections: ['Reasoning', 'Quantitative Aptitude', 'English Language', 'General Knowledge'],
+    aiMode: null,
+    selectedTopics: [],
+    selectedSubtopics: []
   },
   setConfig: (patch) => set(s => ({ config: { ...s.config, ...patch } })),
 
@@ -35,7 +49,7 @@ export const useExamStore = create((set, get) => ({
     return { sections };
   }),
 
-  // ── Exam State ────────────────────────────────────────
+  // ── EXAM STATE (Focus Mode) ──────────────────────────
   currentSectionIndex: 0,
   currentQIndex: 0,
   answers: {},        // `${secIdx}_${qIdx}` → letter
@@ -43,11 +57,13 @@ export const useExamStore = create((set, get) => ({
   qStartTime: null,
   examStartTime: null,
   examEndTime: null,
+  selectedAnswerShowsCorrect: {},  // Track if answer is revealed
 
   setCurrentSection: (idx) => set(s => {
     get().saveCurrentTiming();
     return { currentSectionIndex: idx, currentQIndex: 0, qStartTime: Date.now() };
   }),
+
   setCurrentQ: (idx) => set(s => {
     get().saveCurrentTiming();
     return { currentQIndex: idx, qStartTime: Date.now() };
@@ -69,6 +85,23 @@ export const useExamStore = create((set, get) => ({
   startExamTimer: () => set({ examStartTime: Date.now(), qStartTime: Date.now() }),
   stopExamTimer: () => { get().saveCurrentTiming(); set({ examEndTime: Date.now() }); },
 
+  // ── ANALYTICS STATE ──────────────────────────────────
+  analytics: {
+    totalQuestions: 0,
+    attemptedQuestions: 0,
+    correctAnswers: 0,
+    wrongAnswers: 0,
+    unansweredQuestions: 0,
+    accuracy: 0,
+    totalTime: 0,
+    averageTimePerQuestion: 0,
+    sectionWiseStats: {},
+    topicWiseStats: {},
+    weakAreas: [],
+    strengthAreas: []
+  },
+  setAnalytics: (patch) => set(s => ({ analytics: { ...s.analytics, ...patch } })),
+
   // ── Console Logs ──────────────────────────────────────
   logs: [],
   addLog: (message, logType = 'info') => set(s => ({
@@ -80,8 +113,48 @@ export const useExamStore = create((set, get) => ({
   wsStatus: 'disconnected', // 'disconnected'|'connecting'|'connected'|'error'
   setWsStatus: (wsStatus) => set({ wsStatus }),
 
+  // ── Search ────────────────────────────────────────────
+  searchQuery: '',
+  setSearchQuery: (query) => set({ searchQuery: query }),
+  searchResults: { boards: [], exams: [], tiers: [], papers: [], topics: [], subtopics: [] },
+  setSearchResults: (results) => set({ searchResults: results }),
+
+  // ── UI STATE ──────────────────────────────────────────
+  showConsole: false,
+  toggleConsole: () => set(s => ({ showConsole: !s.showConsole })),
+  expandedAnalyticsItems: {},
+  toggleAnalyticsItem: (key) => set(s => ({
+    expandedAnalyticsItems: { ...s.expandedAnalyticsItems, [key]: !s.expandedAnalyticsItems[key] }
+  })),
+
   // ── Reset ─────────────────────────────────────────────
   resetExam: () => set({
+    sessionId: null,
+    sections: [],
+    currentSectionIndex: 0,
+    currentQIndex: 0,
+    answers: {},
+    timings: {},
+    qStartTime: null,
+    examStartTime: null,
+    examEndTime: null,
+    logs: [],
+    page: 'landing'
+  }),
+
+  resetAll: () => set({
+    page: 'landing',
+    navigation: { selectedBoard: null, selectedExam: null, selectedTier: null, selectedPracticeMode: null },
+    config: {
+      mode: 'exam',
+      exam: 'SSC CGL',
+      difficulty: 'Medium',
+      qPerSection: 5,
+      sections: ['Reasoning', 'Quantitative Aptitude', 'English Language', 'General Knowledge'],
+      aiMode: null,
+      selectedTopics: [],
+      selectedSubtopics: []
+    },
     sessionId: null,
     sections: [],
     currentSectionIndex: 0,

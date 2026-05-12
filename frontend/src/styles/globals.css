@@ -76,6 +76,161 @@
   .section-dot {
     @apply w-2 h-2 rounded-full;
   }
+
+  .eyebrow {
+    @apply text-xs font-mono uppercase tracking-widest text-white/40;
+  }
+
+  .focus-shell,
+  .analytics-shell {
+    background:
+      radial-gradient(circle at top left, rgba(124, 92, 252, 0.18), transparent 34rem),
+      radial-gradient(circle at bottom right, rgba(45, 217, 138, 0.1), transparent 28rem),
+      #07070d;
+  }
+
+  .exam-topbar {
+    @apply sticky top-0 z-50 flex items-center justify-between gap-4 border-b border-white/5 px-4 py-4 md:px-8;
+    background: rgba(7, 7, 13, 0.82);
+    backdrop-filter: blur(18px);
+  }
+
+  .exam-card {
+    @apply rounded-2xl border border-white/10 p-5 shadow-2xl md:p-8;
+    background: linear-gradient(180deg, rgba(19, 19, 31, 0.88), rgba(13, 13, 24, 0.78));
+    backdrop-filter: blur(18px);
+  }
+
+  .question-map-panel {
+    @apply glass h-fit rounded-2xl p-4 lg:sticky lg:top-24;
+  }
+
+  .timer-pill {
+    @apply rounded-xl border border-white/10 bg-white/5 px-4 py-2 font-mono text-sm font-bold text-white;
+  }
+
+  .timer-warning {
+    @apply border-gold/45 bg-gold-dim text-gold;
+  }
+
+  .timer-critical {
+    @apply border-flame/45 bg-flame-dim text-flame animate-pulse;
+  }
+
+  .submit-pill {
+    @apply rounded-xl px-5 py-2.5 font-display text-sm font-bold text-white transition-all duration-200;
+    background: linear-gradient(135deg, #2dd98a, #1fae70);
+  }
+
+  .submit-pill:hover {
+    box-shadow: 0 12px 30px rgba(45, 217, 138, 0.22);
+    transform: translateY(-1px);
+  }
+
+  .option-row {
+    @apply flex w-full items-start gap-4 rounded-xl border border-white/10 bg-white/5 px-4 py-4 text-white/70 transition-all duration-200 md:px-5;
+  }
+
+  .option-row:hover {
+    border-color: rgba(124, 92, 252, 0.4);
+    background: rgba(124, 92, 252, 0.08);
+  }
+
+  .option-row-selected {
+    border-color: rgba(124, 92, 252, 0.7);
+    background: rgba(124, 92, 252, 0.18);
+    color: #ffffff;
+  }
+
+  .option-letter {
+    @apply flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-white/10 font-mono text-sm font-bold text-white/50;
+  }
+
+  .option-letter-selected {
+    @apply border-violet bg-violet text-white;
+  }
+
+  .q-dot {
+    @apply flex h-8 w-8 items-center justify-center rounded-lg border border-white/10 bg-white/5 font-mono text-xs text-white/40 transition-all duration-150;
+  }
+
+  .q-dot:hover {
+    @apply border-white/25 text-white/70;
+  }
+
+  .q-dot-active {
+    @apply border-sky-exam bg-sky-dim text-sky-exam;
+    box-shadow: 0 0 18px rgba(56, 189, 248, 0.18);
+  }
+
+  .q-dot-done {
+    @apply border-violet/50 bg-violet-dim text-violet-soft;
+  }
+
+  .status-pill {
+    @apply inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-semibold;
+  }
+
+  .status-pill-warn {
+    @apply border-gold/35 bg-gold-dim text-gold;
+  }
+
+  .analytics-hero {
+    @apply glass grid gap-6 rounded-2xl border border-white/10 p-6 lg:grid-cols-[0.9fr_1.1fr] lg:p-8;
+  }
+
+  .metric-card {
+    @apply rounded-2xl border border-white/10 bg-white/5 p-5;
+  }
+
+  .insight-row,
+  .recommendation-row,
+  .review-item {
+    @apply rounded-xl border border-white/10 bg-white/5 p-4;
+  }
+
+  .insight-row {
+    @apply flex gap-3 text-sm leading-6 text-white/70;
+  }
+
+  .insight-index {
+    @apply flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-violet-dim font-mono text-xs text-violet-soft;
+  }
+
+  .recommendation-row,
+  .score-line {
+    @apply flex items-center justify-between gap-4;
+  }
+
+  .answer-option {
+    @apply grid grid-cols-[2rem_1fr_auto] items-center gap-3 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white/60;
+  }
+
+  .answer-option-correct {
+    @apply border-emerald-exam/35 bg-emerald-dim text-emerald-exam;
+  }
+
+  .answer-option-wrong {
+    @apply border-flame/35 bg-flame-dim text-flame;
+  }
+
+  .filter-chip {
+    @apply rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm capitalize text-white/50 transition-all duration-200;
+  }
+
+  .filter-chip:hover,
+  .filter-chip-active {
+    @apply border-violet/45 bg-violet-dim text-violet-soft;
+  }
+
+  .search-result-card {
+    @apply rounded-xl border border-white/10 bg-white/5 p-4 text-left transition-all duration-200;
+  }
+
+  .search-result-card:hover {
+    @apply border-violet/35 bg-violet-dim;
+    transform: translateY(-1px);
+  }
 }
 
 /* Noise overlay for depth */
