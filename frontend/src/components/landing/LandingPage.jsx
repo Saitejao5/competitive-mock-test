@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useExamStore } from '../../store/examStore';
+import AuthNav from '../auth/AuthNav';
 
 const PRACTICE_PATHWAYS = [
   {
@@ -70,7 +71,7 @@ export default function LandingPage({ ws }) {
         </div>
         <div className="flex items-center gap-3">
           <span className="tag text-xs">AI-Powered</span>
-          <span className="tag text-xs">Zero-DB</span>
+          <AuthNav />
         </div>
       </nav>
 

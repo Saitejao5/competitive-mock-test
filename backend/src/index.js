@@ -1,18 +1,24 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import cookieParser from 'cookie-parser';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { v4 as uuidv4 } from 'uuid';
 
+import authRoutes from './routes/auth.js';
 import examRoutes from './routes/exam.js';
 import sessionRoutes from './routes/session.js';
+import userRoutes from './routes/user.js';
+import { connectMongo, isMongoReady } from './config/db.js';
 import { SessionStore } from './services/sessionStore.js';
 import { handleWebSocket } from './services/wsHandler.js';
 import { requestLogger } from './middleware/logger.js';
 
 const app = express();
 const httpServer = createServer(app);
+
+await connectMongo();
 
 // ── WebSocket Server ──────────────────────────────────────
 const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
@@ -49,13 +55,23 @@ const heartbeat = setInterval(() => {
 wss.on('close', () => clearInterval(heartbeat));
 
 // ── Express Middleware ────────────────────────────────────
-app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*', credentials: true }));
+const allowedOrigin = process.env.ALLOWED_ORIGIN || 'http://localhost:5173';
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || origin === allowedOrigin) return callback(null, true);
+    return callback(new Error(`CORS blocked for origin ${origin}`));
+  },
+  credentials: true
+}));
 app.use(express.json({ limit: '2mb' }));
+app.use(cookieParser());
 app.use(requestLogger);
 
 // ── Routes ────────────────────────────────────────────────
+app.use('/api/auth', authRoutes);
 app.use('/api/exam', examRoutes);
 app.use('/api/session', sessionRoutes);
+app.use('/api/user', userRoutes);
 
 app.get('/api/health', (req, res) => {
   res.json({
@@ -63,6 +79,7 @@ app.get('/api/health', (req, res) => {
     timestamp: new Date().toISOString(),
     sessions: SessionStore.count(),
     wsClients: wss.clients.size,
+    mongo: isMongoReady() ? 'connected' : 'disabled',
     models: {
       provider: 'OpenRouter',
       primary: process.env.OPENROUTER_PRIMARY_MODEL,

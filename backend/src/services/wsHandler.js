@@ -1,13 +1,10 @@
-// ─────────────────────────────────────────────────────────
-// WEBSOCKET HANDLER
-// Manages real-time exam generation & streaming
-// ─────────────────────────────────────────────────────────
-
 import { v4 as uuidv4 } from 'uuid';
+import { isMongoReady } from '../config/db.js';
 import { SessionStore } from './sessionStore.js';
 import { generateSection } from './questionGenerator.js';
+import { BATCH_SIZE, getBatchForSection, getDefaultExamSections } from './batchService.js';
 
-export async function handleWebSocket(ws, rawData, wss) {
+export async function handleWebSocket(ws, rawData) {
   let message;
   try {
     message = JSON.parse(rawData.toString());
@@ -16,15 +13,15 @@ export async function handleWebSocket(ws, rawData, wss) {
     return;
   }
 
-  console.log(`\x1b[36m[WS →]\x1b[0m ${message.type} from ${ws.clientId}`);
+  console.log(`\x1b[36m[WS ->]\x1b[0m ${message.type} from ${ws.clientId}`);
 
   switch (message.type) {
     case 'START_EXAM':
-      await handleStartExam(ws, message.payload);
+      await handleStartExam(ws, message.payload || {});
       break;
 
     case 'SUBMIT_EXAM':
-      handleSubmitExam(ws, message.payload);
+      handleSubmitExam(ws, message.payload || {});
       break;
 
     case 'PING':
@@ -36,140 +33,143 @@ export async function handleWebSocket(ws, rawData, wss) {
   }
 }
 
-// ─────────────────────────────────────────────────────────
-// START EXAM — Section 1 priority, rest parallel
-// ─────────────────────────────────────────────────────────
 async function handleStartExam(ws, payload) {
   const { config } = payload;
-  const { exam, difficulty, mode, sections, qPerSection } = config;
+  if (!config) {
+    wsSend(ws, { type: 'EXAM_ERROR', message: 'Config required' });
+    return;
+  }
 
-  if (!exam || !difficulty || !sections?.length) {
+  const { exam, difficulty, qPerSection } = config;
+  const sections = config.sections?.length ? config.sections : getDefaultExamSections();
+  const sessionConfig = { ...config, sections };
+
+  if (!exam || !difficulty || !sections.length) {
     wsSend(ws, { type: 'EXAM_ERROR', message: 'Invalid exam configuration' });
     return;
   }
 
   const sessionId = uuidv4();
-  SessionStore.create(sessionId, config);
+  SessionStore.create(sessionId, sessionConfig);
 
-  // Acknowledge
   wsSend(ws, {
     type: 'EXAM_STARTED',
     sessionId,
-    config,
+    config: sessionConfig,
     totalSections: sections.length,
     timestamp: new Date().toISOString()
   });
 
-  wsLog(ws, `Exam started | Session: ${sessionId}`, 'success');
-  wsLog(ws, `Config: ${exam} | ${difficulty} | ${sections.length} sections | ${qPerSection}q each`, 'info');
-  wsLog(ws, `Generation strategy: Section-1 priority → parallel background`, 'info');
+  wsLog(ws, `✓ Exam started | Session: ${sessionId}`, 'success');
+  wsLog(ws, `Config: ${exam} | ${difficulty} | ${sections.length} sections`, 'info');
 
-  // ── PHASE 1: Generate Section 1 immediately ──
-  const firstSection = sections[0];
-  wsLog(ws, `[PHASE 1] Priority generation for "${firstSection}"...`, 'llm');
-
-  wsSend(ws, {
-    type: 'SECTION_GENERATING',
-    sectionName: firstSection,
-    sectionIndex: 0
+  // Send SECTION_GENERATING for ALL sections immediately
+  sections.forEach((sectionName, idx) => {
+    wsSend(ws, { type: 'SECTION_GENERATING', sectionName, sectionIndex: idx });
+    wsLog(ws, `[SECTION-${idx}] Loading "${sectionName}" in parallel`, 'llm');
   });
 
-  try {
-    const q1 = await generateSection({
+  // Create all section tasks in parallel (no await here)
+  const sectionTasks = sections.map((sectionName, sectionIndex) =>
+    getSectionQuestions({
+      ws,
       sessionId,
-      sectionName: firstSection,
-      exam, difficulty,
-      count: qPerSection,
-      previousQuestions: [],
-      questionHashes: new Set(),
-      onLog: (msg, type) => wsLog(ws, msg, type)
-    });
+      sectionName,
+      exam,
+      difficulty,
+      qPerSection,
+      payload
+    })
+      .then(questions => ({ sectionIndex, sectionName, questions, error: null }))
+      .catch(error => ({ sectionIndex, sectionName, error, questions: null }))
+  );
 
-    SessionStore.storeSection(sessionId, firstSection, q1);
+  // Deliver results as they complete
+  const deliverResult = ({ sectionIndex, sectionName, questions, error }) => {
+    if (error) {
+      wsLog(ws, `[SECTION-${sectionIndex}] ✗ Failed: ${error.message}`, 'error');
+      if (ws.readyState === 1) {
+        wsSend(ws, { type: 'SECTION_ERROR', sectionIndex, sectionName, error: error.message });
+      }
+      return false;
+    }
 
-    wsSend(ws, {
-      type: 'SECTION_READY',
-      sectionIndex: 0,
-      sectionName: firstSection,
-      questions: q1,
-      sessionId
-    });
+    if (questions.length !== BATCH_SIZE) {
+      wsLog(ws, `[SECTION-${sectionIndex}] ⚠️  Got ${questions.length}/${BATCH_SIZE} questions`, 'warn');
+    }
 
-    wsLog(ws, `[PHASE 1 ✓] "${firstSection}" ready — ${q1.length} questions delivered`, 'success');
-  } catch (err) {
-    wsLog(ws, `[PHASE 1 ✗] "${firstSection}" failed: ${err.message}`, 'error');
-    wsSend(ws, {
-      type: 'SECTION_ERROR',
-      sectionIndex: 0,
-      sectionName: firstSection,
-      error: err.message
-    });
-  }
+    SessionStore.storeSection(sessionId, sectionName, questions);
+    if (ws.readyState === 1) {
+      wsSend(ws, { type: 'SECTION_READY', sectionIndex, sectionName, questions, sessionId });
+      wsLog(ws, `[SECTION-${sectionIndex}] ✓ Ready (${questions.length} questions)`, 'success');
+    }
+    return true;
+  };
 
-  // ── PHASE 2: Parallel background generation ──
-  if (sections.length > 1) {
-    wsLog(ws, `[PHASE 2] Launching parallel background generation for ${sections.length - 1} sections`, 'llm');
-
-    const bgTasks = sections.slice(1).map(async (sectionName, idx) => {
-      const sectionIndex = idx + 1;
-
-      wsSend(ws, { type: 'SECTION_GENERATING', sectionName, sectionIndex });
-      wsLog(ws, `[BG-${sectionIndex}] Queued "${sectionName}"`, 'llm');
-
-      try {
-        const session = SessionStore.get(sessionId);
-        const prevQ = session ? session.generatedQuestions : [];
-        const hashes = session ? session.questionHashes : new Set();
-
-        const questions = await generateSection({
-          sessionId,
-          sectionName,
-          exam, difficulty,
-          count: qPerSection,
-          previousQuestions: prevQ,
-          questionHashes: hashes,
-          onLog: (msg, type) => wsLog(ws, msg, type)
-        });
-
-        SessionStore.storeSection(sessionId, sectionName, questions);
-
-        // Check ws still alive
-        if (ws.readyState === 1) {
-          wsSend(ws, {
-            type: 'SECTION_READY',
-            sectionIndex,
-            sectionName,
-            questions,
-            sessionId
-          });
-          wsLog(ws, `[BG-${sectionIndex} ✓] "${sectionName}" ready — ${questions.length} questions`, 'success');
-        }
-      } catch (err) {
-        wsLog(ws, `[BG-${sectionIndex} ✗] "${sectionName}" failed: ${err.message}`, 'error');
-        if (ws.readyState === 1) {
-          wsSend(ws, {
-            type: 'SECTION_ERROR',
-            sectionIndex,
-            sectionName,
-            error: err.message
-          });
+  // Execute all in parallel and deliver results as they complete
+  Promise.allSettled(sectionTasks)
+    .then(results => {
+      let successCount = 0;
+      for (const result of results) {
+        if (result.status === 'fulfilled') {
+          if (deliverResult(result.value)) {
+            successCount++;
+          }
+        } else {
+          wsLog(ws, `[SECTION] Unexpected rejection: ${result.reason?.message || 'Unknown'}`, 'error');
         }
       }
-    });
 
-    // Fire and forget — don't await
-    Promise.all(bgTasks).then(() => {
-      wsLog(ws, `[PHASE 2 ✓] All background sections complete`, 'success');
-      if (ws.readyState === 1) {
+      if (successCount === sections.length && ws.readyState === 1) {
+        wsLog(ws, `✓ All ${sections.length} sections ready`, 'success');
         wsSend(ws, { type: 'ALL_SECTIONS_READY', sessionId });
       }
+    })
+    .catch(err => {
+      wsLog(ws, `[EXAM] Unexpected error: ${err.message}`, 'error');
+      if (ws.readyState === 1) {
+        wsSend(ws, { type: 'EXAM_ERROR', message: err.message });
+      }
     });
-  }
 }
 
-// ─────────────────────────────────────────────────────────
-// SUBMIT EXAM
-// ─────────────────────────────────────────────────────────
+async function getSectionQuestions({ ws, sessionId, sectionName, exam, difficulty, qPerSection, payload }) {
+  const batch = await getBatchForSection({
+    userKey: payload.userId || payload.userKey || ws.clientId,
+    requestedSection: sectionName,
+    exam,
+    difficulty,
+    limit: qPerSection || BATCH_SIZE,
+    onLog: (msg, type) => wsLog(ws, msg, type)
+  }).catch((err) => {
+    wsLog(ws, `[BATCH] ${sectionName} failed: ${err.message}`, 'error');
+    if (isMongoReady()) throw err;
+    return null;
+  });
+
+  if (batch?.questions?.length) {
+    wsLog(ws, `[BATCH] ${sectionName} served from ${batch.source} batch ${batch.batchId}`, 'success');
+    return batch.questions;
+  }
+
+  if (isMongoReady()) {
+    throw new Error(`No unseen questions could be served for ${sectionName} after DB refill`);
+  }
+
+  wsLog(ws, `[LEGACY] Falling back to direct section generation for "${sectionName}"`, 'warn');
+  const session = SessionStore.get(sessionId);
+  return generateSection({
+    sessionId,
+    sectionName,
+    exam,
+    difficulty,
+    count: qPerSection || BATCH_SIZE,
+    previousQuestions: session ? session.generatedQuestions : [],
+    questionHashes: session ? session.questionHashes : new Set(),
+    onLog: (msg, type) => wsLog(ws, msg, type)
+  });
+}
+
 function handleSubmitExam(ws, payload) {
   const { sessionId, answers, timings } = payload;
 
@@ -179,25 +179,16 @@ function handleSubmitExam(ws, payload) {
     return;
   }
 
-  // Store analytics in session
   SessionStore.update(sessionId, s => {
-    s.analytics.answers = answers;
-    s.analytics.timings = timings;
+    s.analytics.answers = answers || {};
+    s.analytics.timings = timings || {};
     s.analytics.endTime = Date.now();
   });
 
-  wsLog(ws, `Exam submitted | Session: ${sessionId} | Answers: ${Object.keys(answers).length}`, 'success');
-
-  wsSend(ws, {
-    type: 'EXAM_SUBMITTED',
-    sessionId,
-    timestamp: new Date().toISOString()
-  });
+  wsLog(ws, `Exam submitted | Session: ${sessionId} | Answers: ${Object.keys(answers || {}).length}`, 'success');
+  wsSend(ws, { type: 'EXAM_SUBMITTED', sessionId, timestamp: new Date().toISOString() });
 }
 
-// ─────────────────────────────────────────────────────────
-// HELPERS
-// ─────────────────────────────────────────────────────────
 function wsSend(ws, data) {
   if (ws.readyState === 1) {
     ws.send(JSON.stringify(data));
@@ -206,11 +197,7 @@ function wsSend(ws, data) {
 
 function wsLog(ws, message, type = 'info') {
   const ts = new Date().toISOString().split('T')[1].slice(0, 8);
-  console.log(`\x1b[${type === 'error' ? '31' : type === 'success' ? '32' : type === 'llm' ? '35' : type === 'stream' ? '36' : type === 'warn' ? '33' : '34'}m[${ts}]\x1b[0m ${message}`);
-  wsSend(ws, {
-    type: 'LOG',
-    message,
-    logType: type,
-    timestamp: ts
-  });
+  const color = type === 'error' ? '31' : type === 'success' ? '32' : type === 'llm' ? '35' : type === 'stream' ? '36' : type === 'warn' ? '33' : '34';
+  console.log(`\x1b[${color}m[${ts}]\x1b[0m ${message}`);
+  wsSend(ws, { type: 'LOG', message, logType: type, timestamp: ts });
 }

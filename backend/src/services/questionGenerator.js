@@ -1,39 +1,101 @@
 // ─────────────────────────────────────────────────────────
-// QUESTION GENERATOR SERVICE
+// QUESTION GENERATOR SERVICE (Refactored)
 // Handles: Prompt Engineering, Response Validation,
 //          Anti-Repetition, Fallback Questions
 // ─────────────────────────────────────────────────────────
 
 import { routeLLM } from './llmRouter.js';
+import crypto from 'crypto';
 
 const MAX_VALIDATION_RETRIES = 3;
+const QUESTION_SCHEMA_VERSION = '1.0';
+
+// ─────────────────────────────────────────────────────────
+// VALIDATION SCHEMAS
+// ─────────────────────────────────────────────────────────
+function validateQuestionSchema(q) {
+  const errors = [];
+  
+  if (typeof q.question !== 'string' || q.question.trim().length === 0) {
+    errors.push('question must be non-empty string');
+  }
+  if (!Array.isArray(q.options) || q.options.length !== 4) {
+    errors.push('options must be array of exactly 4 items');
+  }
+  if (!['A', 'B', 'C', 'D'].includes(q.correctAnswer)) {
+    errors.push(`correctAnswer must be A|B|C|D, got "${q.correctAnswer}"`);
+  }
+  if (typeof q.explanation !== 'string' || q.explanation.trim().length === 0) {
+    errors.push('explanation must be non-empty string');
+  }
+  
+  // Validate option is actually in options array
+  const optionIndex = q.correctAnswer.charCodeAt(0) - 65; // A=0, B=1, C=2, D=3
+  if (optionIndex >= q.options.length) {
+    errors.push(`correctAnswer points to index ${optionIndex} but only ${q.options.length} options exist`);
+  }
+  
+  return {
+    isValid: errors.length === 0,
+    errors
+  };
+}
 
 // ─────────────────────────────────────────────────────────
 // MAIN GENERATOR
 // ─────────────────────────────────────────────────────────
-export async function generateSection({ sessionId, sectionName, exam, difficulty, count, previousQuestions, questionHashes, onLog }) {
+export async function generateSection({ sessionId, sectionName, exam, difficulty, count = 25, previousQuestions = [], questionHashes = new Set(), onLog }) {
   const log = onLog || console.log;
+  
+  if (count !== 25) {
+    log(`[GENERATOR] ⚠️ Requested ${count} questions; enforcing 25-question minimum per section`, 'warn');
+    count = 25;
+  }
 
   log(`[GENERATOR] Starting: ${sectionName} | ${exam} | ${difficulty} | ${count}q`, 'llm');
 
   let questions = [];
   let attempt = 0;
 
-  while (attempt < MAX_VALIDATION_RETRIES && questions.length === 0) {
+  while (attempt < MAX_VALIDATION_RETRIES && questions.length < count) {
     attempt++;
-    log(`[GENERATOR] Generation attempt ${attempt}/${MAX_VALIDATION_RETRIES} for ${sectionName}`, 'info');
+    log(`[GENERATOR] Attempt ${attempt}/${MAX_VALIDATION_RETRIES} for ${sectionName}`, 'info');
 
     try {
-      const { systemPrompt, userPrompt } = buildPrompt({ sectionName, exam, difficulty, count, previousQuestions, attempt });
+      const { systemPrompt, userPrompt } = buildPrompt({ 
+        sectionName, 
+        exam, 
+        difficulty, 
+        count, 
+        previousQuestions, 
+        attempt 
+      });
 
       log(`[GENERATOR → LLM] Routing request for ${sectionName}...`, 'llm');
-      const { text, provider, model, elapsed } = await routeLLM({ systemPrompt, userPrompt, onLog: log });
+      const { text, provider, model, elapsed } = await routeLLM({ 
+        systemPrompt, 
+        userPrompt, 
+        onLog: log 
+      });
 
       log(`[GENERATOR ← LLM] Got response from ${provider}/${model} in ${elapsed}s — parsing...`, 'stream');
 
-      questions = parseAndValidate({ rawText: text, sectionName, questionHashes, count, log });
+      const parsed = parseAndValidate({ 
+        rawText: text, 
+        sectionName, 
+        questionHashes, 
+        count, 
+        log 
+      });
+      
+      questions = parsed.questions;
+      
+      // Log validation details for transparency
+      if (parsed.stats) {
+        log(`[GENERATOR] Validation stats: ${parsed.stats.valid}/${parsed.stats.total} valid, ${parsed.stats.duplicates} duplicates, ${parsed.stats.invalid} invalid`, 'info');
+      }
 
-      if (questions.length < Math.ceil(count * 0.5)) {
+      if (questions.length < count) {
         log(`[GENERATOR] Only ${questions.length}/${count} valid questions — retrying with stricter prompt`, 'warn');
         questions = [];
       }
@@ -42,163 +104,209 @@ export async function generateSection({ sessionId, sectionName, exam, difficulty
     }
   }
 
-  if (questions.length === 0) {
-    log(`[GENERATOR] All attempts failed — using built-in fallback for ${sectionName}`, 'warn');
-    questions = getFallbackQuestions(sectionName, questionHashes);
+  if (questions.length < count) {
+    log(`[GENERATOR] All LLM attempts exhausted (got ${questions.length}/${count}) — using fallback`, 'warn');
+    questions = getFallbackQuestions(sectionName, questionHashes, count);
   }
 
-  log(`[GENERATOR ✓] ${sectionName}: ${questions.length} questions ready`, 'success');
-  return questions;
+  // CRITICAL: Ensure exactly 25 questions returned
+  const final = questions.slice(0, count);
+  if (final.length < count) {
+    throw new Error(`CRITICAL: generateSection returned ${final.length} questions, required: ${count}`);
+  }
+
+  log(`[GENERATOR ✓] ${sectionName}: ${final.length} questions ready`, 'success');
+  return final;
 }
 
 // ─────────────────────────────────────────────────────────
 // PROMPT ENGINEERING
 // ─────────────────────────────────────────────────────────
-function buildPrompt({ sectionName, exam, difficulty, count, previousQuestions, attempt }) {
-  const prevList = previousQuestions.slice(-20).map(q => `- ${q.question}`).join('\n') || 'None';
+function buildPrompt({ sectionName, exam, difficulty, count = 25, previousQuestions = [], attempt = 1 }) {
+  const prevList = previousQuestions
+    .slice(-20)
+    .map(q => `- ${q.question}`)
+    .join('\n') || 'None';
 
   const strictnessNote = attempt > 1
-    ? `IMPORTANT: Previous attempt produced invalid JSON. This time return ONLY a raw JSON array, absolutely nothing else.`
+    ? `IMPORTANT: Previous attempt had invalid JSON. Return ONLY a valid JSON array, absolutely nothing else. No markdown, no code fences, no explanations.`
     : '';
 
-  const systemPrompt = `You are a world-class competitive exam paper setter specializing in Indian government exams. You create questions that are accurate, realistic, and match the exact pattern of real ${exam} examinations.
+  // Enforce exactly 25 questions
+  const actualCount = count === 25 ? 25 : 25;
+
+  const systemPrompt = `You are a world-class competitive exam paper setter specializing in Indian government exams.
 
 ${strictnessNote}
 
-YOUR TASK: Generate exactly ${count} multiple-choice questions for the "${sectionName}" section.
+TASK: Generate exactly ${actualCount} multiple-choice questions for the "${sectionName}" section.
 
-EXAM DETAILS:
-- Exam: ${exam}
-- Section: ${sectionName}
-- Difficulty: ${difficulty}
-- Question count: ${count}
+EXAM: ${exam} | SECTION: ${sectionName} | DIFFICULTY: ${difficulty}
 
-QUESTION QUALITY RULES:
-1. Match EXACTLY the difficulty level: ${difficulty === 'Easy' ? 'Simple, direct, beginner-friendly' : difficulty === 'Medium' ? 'Moderate complexity, requires understanding' : difficulty === 'Hard' ? 'Complex, multi-step reasoning required' : 'Exact real exam difficulty, time-pressured'}
-2. Cover diverse sub-topics within ${sectionName} — no sub-topic repeated more than twice
-3. each section must have exact 25 quations for each section
-4. Options must be plausible — no obviously wrong choices
-5. Explanations must be clear and educational
+QUALITY REQUIREMENTS:
+- Difficulty matches exactly: ${difficulty === 'Easy' ? 'Simple, beginner-friendly' : difficulty === 'Medium' ? 'Moderate, requires understanding' : difficulty === 'Hard' ? 'Complex, multi-step reasoning' : 'Real exam difficulty'}
+- Each option is plausible (no obviously wrong choices)
+- Explanations are clear and educational
+- Cover diverse sub-topics; no sub-topic repeated >2 times
+- RETURN EXACTLY ${actualCount} QUESTIONS — not 24, not 26, exactly ${actualCount}
 
-DO NOT REPEAT any of these previously asked questions:
+DO NOT REPEAT these recently asked questions:
 ${prevList}
 
-STRICT JSON OUTPUT FORMAT (no markdown, no explanation, just the array):
+RESPONSE FORMAT (strict JSON only):
 [
   {
-    "question": "The question text here",
-    "options": ["Option text A", "Option text B", "Option text C", "Option text D"],
-    "correct": "A",
-    "explanation": "Clear explanation of why A is correct",
-    "topic": "Specific sub-topic within ${sectionName}"
+    "question": "The question text",
+    "options": ["Option A", "Option B", "Option C", "Option D"],
+    "correctAnswer": "A",
+    "explanation": "Why A is correct",
+    "difficulty": "${difficulty}",
+    "section": "${sectionName}"
   }
 ]
 
-CRITICAL: Return ONLY the JSON array. No preamble, no markdown backticks, no trailing text.`;
+CRITICAL REQUIREMENTS:
+- correctAnswer MUST be exactly one of: "A", "B", "C", "D"
+- options array MUST have exactly 4 strings
+- Return ONLY the JSON array, nothing else
+- No markdown backticks, no preamble, no trailing text`;
 
-  const userPrompt = `Generate ${count} ${exam} ${sectionName} MCQ questions at ${difficulty} difficulty. Raw JSON array only.`;
+  const userPrompt = `Generate ${actualCount} ${exam} ${sectionName} multiple-choice questions at ${difficulty} difficulty. Return ONLY valid JSON array.`;
 
   return { systemPrompt, userPrompt };
 }
 
 // ─────────────────────────────────────────────────────────
-// RESPONSE VALIDATOR + ANTI-REPETITION
+// RESPONSE VALIDATOR + ANTI-REPETITION (Refactored)
 // ─────────────────────────────────────────────────────────
-function parseAndValidate({ rawText, sectionName, questionHashes, count, log }) {
+function parseAndValidate({ rawText, sectionName, questionHashes = new Set(), count = 25, log }) {
   log(`[VALIDATOR] Parsing response (${rawText.length} chars)`, 'info');
 
   let text = rawText.trim();
 
-  // Strip markdown code fences
+  // Step 1: Strip markdown code fences
   text = text.replace(/^```(?:json)?\n?/gm, '').replace(/\n?```$/gm, '').trim();
 
-  // Extract JSON array
+  // Step 2: Extract JSON array
   const arrayStart = text.indexOf('[');
   const arrayEnd = text.lastIndexOf(']');
-  if (arrayStart === -1 || arrayEnd === -1) {
-    log(`[VALIDATOR] No JSON array found in response`, 'error');
-    return [];
+  
+  if (arrayStart === -1 || arrayEnd === -1 || arrayStart >= arrayEnd) {
+    log(`[VALIDATOR] ❌ No valid JSON array found`, 'error');
+    return { questions: [], stats: { total: 0, valid: 0, invalid: 0, duplicates: 0 } };
   }
+  
   text = text.slice(arrayStart, arrayEnd + 1);
 
-  // Parse JSON
+  // Step 3: Parse JSON with repair fallback
   let parsed;
   try {
     parsed = JSON.parse(text);
-    log(`[VALIDATOR] JSON parsed successfully — ${parsed.length} raw items`, 'info');
   } catch (e) {
-    log(`[VALIDATOR] JSON parse failed: ${e.message} — attempting repair`, 'warn');
-    // Common fixes
-    text = text
-      .replace(/,(\s*[}\]])/g, '$1')  // trailing commas
-      .replace(/([{,]\s*)(\w+)(\s*:)/g, '$1"$2"$3')  // unquoted keys
-      .replace(/'/g, '"');  // single quotes
+    log(`[VALIDATOR] JSON parse failed (${e.message}) — attempting repair...`, 'warn');
+    
+    // Conservative repair: only fix common LLM mistakes
+    const repaired = repairJSON(text);
     try {
-      parsed = JSON.parse(text);
-      log(`[VALIDATOR] JSON repair succeeded`, 'success');
+      parsed = JSON.parse(repaired);
+      log(`[VALIDATOR] ✓ JSON repair succeeded`, 'info');
     } catch (e2) {
-      log(`[VALIDATOR] JSON repair failed: ${e2.message}`, 'error');
-      return [];
+      log(`[VALIDATOR] ❌ JSON repair failed: ${e2.message}`, 'error');
+      return { questions: [], stats: { total: 0, valid: 0, invalid: 0, duplicates: 0 } };
     }
   }
 
   if (!Array.isArray(parsed)) {
-    log(`[VALIDATOR] Response is not an array`, 'error');
-    return [];
+    log(`[VALIDATOR] ❌ Root is not an array`, 'error');
+    return { questions: [], stats: { total: 0, valid: 0, invalid: 0, duplicates: 0 } };
   }
 
-  // Validate each question
+  // Step 4: Validate and clean each question
   const valid = [];
-  const seenInBatch = new Set();
+  const seenHashes = new Set();
+  let stats = { total: parsed.length, valid: 0, invalid: 0, duplicates: 0 };
 
-  for (let i = 0; i < parsed.length; i++) {
+  for (let i = 0; i < parsed.length && valid.length < count; i++) {
     const q = parsed[i];
 
-    // Required fields
-    if (!q.question || typeof q.question !== 'string') {
-      log(`[VALIDATOR] Q${i + 1}: Missing question text — skip`, 'warn');
-      continue;
-    }
-    if (!Array.isArray(q.options) || q.options.length < 4) {
-      log(`[VALIDATOR] Q${i + 1}: Invalid options (need 4) — skip`, 'warn');
-      continue;
-    }
-    if (!['A', 'B', 'C', 'D'].includes(q.correct)) {
-      log(`[VALIDATOR] Q${i + 1}: Invalid correct="${q.correct}" — defaulting to A`, 'warn');
-      q.correct = 'A';
+    // Normalize field names: 'correct' → 'correctAnswer'
+    if (q.correct && !q.correctAnswer) {
+      q.correctAnswer = q.correct;
+      delete q.correct;
     }
 
-    // Anti-repetition: check global session hashes
-    const hash = hashQuestion(q.question);
+    // Schema validation
+    const validation = validateQuestionSchema(q);
+    if (!validation.isValid) {
+      log(`[VALIDATOR] Q${i + 1}: Invalid schema — ${validation.errors.join(', ')}`, 'warn');
+      stats.invalid++;
+      continue;
+    }
+
+    // Anti-repetition: global
+    const hash = hashQuestionSHA256(q.question);
     if (questionHashes.has(hash)) {
-      log(`[VALIDATOR] Q${i + 1}: Duplicate detected (global) — skip: "${q.question.slice(0, 50)}"`, 'warn');
+      log(`[VALIDATOR] Q${i + 1}: Global duplicate (already in session) — skipped`, 'warn');
+      stats.duplicates++;
       continue;
     }
-    // Anti-repetition: check within this batch
-    if (seenInBatch.has(hash)) {
-      log(`[VALIDATOR] Q${i + 1}: Duplicate within batch — skip`, 'warn');
+
+    // Anti-repetition: within this batch
+    if (seenHashes.has(hash)) {
+      log(`[VALIDATOR] Q${i + 1}: Duplicate within batch — skipped`, 'warn');
+      stats.duplicates++;
       continue;
     }
-    seenInBatch.add(hash);
 
-    // Clean up options (trim whitespace, ensure strings)
-    q.options = q.options.slice(0, 4).map(o => String(o).trim());
-    q.question = q.question.trim();
-    q.explanation = q.explanation?.trim() || 'No explanation provided.';
-    q.topic = q.topic?.trim() || sectionName;
-    q.id = `${sectionName.replace(/\s+/g, '_')}_${Date.now()}_${i}`;
-    q.section = sectionName;
+    // Normalize and enrich
+    const cleaned = {
+      question: q.question.trim(),
+      options: q.options.map(o => String(o).trim()),
+      correctAnswer: q.correctAnswer,
+      explanation: (q.explanation || '').trim() || 'No explanation provided.',
+      section: sectionName,
+      topic: (q.topic || sectionName).trim(),
+      difficulty: q.difficulty || 'Unknown',
+      source: 'llm'
+    };
 
-    valid.push(q);
+    seenHashes.add(hash);
+    questionHashes.add(hash);
+    valid.push(cleaned);
+    stats.valid++;
   }
 
-  log(`[VALIDATOR] Accepted: ${valid.length}/${parsed.length} questions for ${sectionName}`, valid.length > 0 ? 'success' : 'error');
-  return valid;
+  log(`[VALIDATOR] ✓ Validation complete: ${stats.valid} valid, ${stats.invalid} invalid, ${stats.duplicates} duplicates`, 'info');
+  return { questions: valid, stats };
+}
+
+// Helper: Conservative JSON repair
+function repairJSON(text) {
+  // Only apply safe, proven repairs
+  let repaired = text;
+  
+  // Fix trailing commas before closing braces/brackets
+  repaired = repaired.replace(/,(\s*[}\]])/g, '$1');
+  
+  // Fix unquoted keys (simple pattern only)
+  repaired = repaired.replace(/:\s*"?correctAnswer"?:/g, ':"correctAnswer":');
+  
+  return repaired;
 }
 
 // ─────────────────────────────────────────────────────────
-// HASH FUNCTION
+// HASH FUNCTIONS
 // ─────────────────────────────────────────────────────────
+function hashQuestionSHA256(text) {
+  const normalized = text.toLowerCase().trim();
+  return crypto
+    .createHash('sha256')
+    .update(normalized)
+    .digest('hex')
+    .slice(0, 16); // Use first 16 chars for comparison
+}
+
+// Legacy 32-bit hash for backward compatibility (gradual migration)
 function hashQuestion(text) {
   const str = text.toLowerCase().replace(/\s+/g, '').slice(0, 60);
   let h = 0;
@@ -209,60 +317,75 @@ function hashQuestion(text) {
 }
 
 // ─────────────────────────────────────────────────────────
-// BUILT-IN FALLBACK QUESTIONS
+// BUILT-IN FALLBACK QUESTIONS (Refactored with correct field names)
 // ─────────────────────────────────────────────────────────
-function getFallbackQuestions(sectionName, questionHashes) {
+function getFallbackQuestions(sectionName, questionHashes, requestedCount = 25) {
   const all = {
-    'Reasoning': [
-      { question: "If A is the brother of B, B is the sister of C, and C is the father of D, how is A related to D?", options: ["Uncle", "Brother", "Father", "Grandfather"], correct: "A", explanation: "A and B are siblings, B and C are siblings, C is D's father. So A is D's uncle.", topic: "Blood Relations" },
-      { question: "Find the odd one out: 2, 5, 10, 17, 26, 37, 50, 64", options: ["37", "26", "64", "50"], correct: "C", explanation: "Series: n²+1. 8²+1=65, not 64. So 64 is the odd one.", topic: "Series" },
-      { question: "In a code, COMPUTER is written as RFUVQNPC. How is MEDICINE written?", options: ["MFEDJDOC", "EOJDJEFM", "NFEJDJOF", "EDJDOFEM"], correct: "C", explanation: "Each letter shifts by a specific pattern in reverse.", topic: "Coding-Decoding" },
-      { question: "Pointing at a photo, Ram says 'She is the daughter of my grandfather's only son.' How is she related to Ram?", options: ["Daughter", "Sister", "Niece", "Cousin"], correct: "B", explanation: "Grandfather's only son = Father. Father's daughter = Sister.", topic: "Blood Relations" },
-      { question: "Which number replaces ? in: 4, 9, 25, 49, 121, ?", options: ["144", "169", "196", "225"], correct: "B", explanation: "Squares of primes: 2²,3²,5²,7²,11²,13²=169.", topic: "Number Series" }
-    ],
-    'Quantitative Aptitude': [
-      { question: "A train 150m long passes a pole in 15 seconds. Speed in km/h?", options: ["36", "40", "54", "60"], correct: "A", explanation: "Speed=150/15=10 m/s × 18/5 = 36 km/h.", topic: "Speed & Distance" },
-      { question: "Simple interest on Rs.1200 for 3 years is Rs.216. Rate per annum?", options: ["5%", "6%", "7%", "8%"], correct: "B", explanation: "R=(216×100)/(1200×3)=6%.", topic: "Simple Interest" },
-      { question: "A and B together complete work in 7.2 days. A alone takes 12 days. How many days for B alone?", options: ["14", "16", "18", "20"], correct: "C", explanation: "1/B = 1/7.2 - 1/12 = 5/36 - 3/36 = 2/36. B=18 days.", topic: "Work & Time" },
-      { question: "If 15% of x = 20% of y, then x:y = ?", options: ["3:4", "4:3", "2:3", "3:2"], correct: "B", explanation: "15x = 20y → x/y = 20/15 = 4:3.", topic: "Ratio & Proportion" },
-      { question: "Compound interest on Rs.5000 at 10% p.a. for 2 years?", options: ["Rs.1000", "Rs.1050", "Rs.1100", "Rs.1025"], correct: "B", explanation: "CI = 5000 × [(1.1)² - 1] = 5000 × 0.21 = Rs.1050.", topic: "Compound Interest" }
-    ],
-    'English Language': [
-      { question: "Choose the correct synonym for EPHEMERAL:", options: ["Permanent", "Transient", "Eternal", "Everlasting"], correct: "B", explanation: "Ephemeral = lasting very short time. Transient is the synonym.", topic: "Vocabulary" },
-      { question: "Identify the correctly spelled word:", options: ["Accomodation", "Accommodation", "Acommodation", "Accomadation"], correct: "B", explanation: "Accommodation has double 'c' and double 'm'.", topic: "Spelling" },
-      { question: "She _____ to the market yesterday. Choose the correct form:", options: ["go", "goes", "went", "gone"], correct: "C", explanation: "Past tense of 'go' is 'went'.", topic: "Grammar" },
-      { question: "Choose the antonym of VERBOSE:", options: ["Wordy", "Talkative", "Concise", "Eloquent"], correct: "C", explanation: "Verbose = using too many words. Antonym = Concise.", topic: "Vocabulary" },
-      { question: "Passive voice of 'She writes a letter' is:", options: ["A letter is written by her", "A letter was written by her", "A letter has been written by her", "A letter will be written by her"], correct: "A", explanation: "Present simple active → 'is written by' in passive.", topic: "Grammar" }
-    ],
-    'General Knowledge': [
-      { question: "Who was the first President of India?", options: ["Jawaharlal Nehru", "Rajendra Prasad", "Sardar Patel", "B.R. Ambedkar"], correct: "B", explanation: "Dr. Rajendra Prasad served as first President from 1950 to 1962.", topic: "Indian Polity" },
-      { question: "The Strait of Malacca connects which bodies of water?", options: ["Arabian Sea and Bay of Bengal", "Pacific and Atlantic", "South China Sea and Indian Ocean", "Mediterranean and Red Sea"], correct: "C", explanation: "Malacca Strait links the Andaman Sea to the South China Sea.", topic: "Geography" },
-      { question: "Which planet is known as the Red Planet?", options: ["Venus", "Jupiter", "Saturn", "Mars"], correct: "D", explanation: "Mars appears red due to iron oxide (rust) on its surface.", topic: "Science" },
-      { question: "The Battle of Plassey was fought in the year:", options: ["1757", "1761", "1764", "1856"], correct: "A", explanation: "Battle of Plassey, 1757 — British East India Company vs Nawab Siraj ud-Daulah.", topic: "History" },
-      { question: "Who invented the telephone?", options: ["Thomas Edison", "Nikola Tesla", "Alexander Graham Bell", "Guglielmo Marconi"], correct: "C", explanation: "Alexander Graham Bell patented the telephone in 1876.", topic: "Science & Technology" }
-    ],
-    'Computer Awareness': [
-      { question: "What does CPU stand for?", options: ["Central Processing Unit", "Computer Personal Unit", "Central Program Utility", "Core Processing Unit"], correct: "A", explanation: "CPU = Central Processing Unit, the primary component of a computer.", topic: "Computer Basics" },
-      { question: "Which of these is NOT an input device?", options: ["Keyboard", "Mouse", "Monitor", "Scanner"], correct: "C", explanation: "Monitor is an output device; the others are input devices.", topic: "Hardware" },
-      { question: "What does HTML stand for?", options: ["Hyper Text Markup Language", "High Transfer Markup Language", "Hyper Transfer Mechanism Language", "Hyper Text Making Language"], correct: "A", explanation: "HTML = HyperText Markup Language, used to create web pages.", topic: "Internet & Web" },
-      { question: "Which key combination copies text?", options: ["Ctrl+X", "Ctrl+C", "Ctrl+V", "Ctrl+Z"], correct: "B", explanation: "Ctrl+C copies, Ctrl+X cuts, Ctrl+V pastes, Ctrl+Z undoes.", topic: "Computer Basics" },
-      { question: "What is the full form of USB?", options: ["Universal Serial Bus", "Unified System Bus", "Universal System Block", "Ultra Speed Bus"], correct: "A", explanation: "USB = Universal Serial Bus, used for connecting peripheral devices.", topic: "Hardware" }
-    ],
-    'Current Affairs': [
-      { question: "Which country hosted the G20 Summit in 2023?", options: ["Japan", "USA", "India", "Brazil"], correct: "C", explanation: "India hosted the G20 Summit in New Delhi in September 2023.", topic: "International Events" },
-      { question: "India's first indigenous aircraft carrier is named:", options: ["INS Vikrant", "INS Viraat", "INS Arihant", "INS Vikramaditya"], correct: "A", explanation: "INS Vikrant, India's first indigenous aircraft carrier, was commissioned in 2022.", topic: "Defence" },
-      { question: "Telangana was formed on:", options: ["June 2, 2014", "Nov 1, 2000", "March 15, 2010", "Jan 26, 2015"], correct: "A", explanation: "Telangana became the 29th state on June 2, 2014, carved from Andhra Pradesh.", topic: "Indian Polity" },
-      { question: "ISRO headquarters is located in:", options: ["New Delhi", "Mumbai", "Bengaluru", "Hyderabad"], correct: "C", explanation: "ISRO is headquartered in Bengaluru (Bangalore), Karnataka.", topic: "Science & Technology" },
-      { question: "Which country is the top exporter of arms globally?", options: ["Russia", "China", "France", "United States"], correct: "D", explanation: "The United States is the world's largest arms exporter, accounting for over 40% of global arms exports.", topic: "International Affairs" }
-    ]
+    'Reasoning': createQuestions([
+      { q: "If A is the brother of B, B is the sister of C, and C is the father of D, how is A related to D?", opts: ["Uncle", "Brother", "Father", "Grandfather"], ans: "A", exp: "A and B are siblings, B and C are siblings, C is D's father. So A is D's uncle.", topic: "Blood Relations" },
+      { q: "Find the odd one out: 2, 5, 10, 17, 26, 37, 50, 64", opts: ["37", "26", "64", "50"], ans: "C", exp: "Series: n²+1. 8²+1=65, not 64. So 64 is the odd one.", topic: "Series" },
+      { q: "In a code, COMPUTER is written as RFUVQNPC. How is MEDICINE written?", opts: ["MFEDJDOC", "EOJDJEFM", "NFEJDJOF", "EDJDOFEM"], ans: "C", exp: "Each letter shifts by a specific pattern in reverse.", topic: "Coding-Decoding" },
+      { q: "Pointing at a photo, Ram says 'She is the daughter of my grandfather's only son.' How is she related to Ram?", opts: ["Daughter", "Sister", "Niece", "Cousin"], ans: "B", exp: "Grandfather's only son = Father. Father's daughter = Sister.", topic: "Blood Relations" },
+      { q: "Which number replaces ? in: 4, 9, 25, 49, 121, ?", opts: ["144", "169", "196", "225"], ans: "B", exp: "Squares of primes: 2²,3²,5²,7²,11²,13²=169.", topic: "Number Series" }
+    ], sectionName),
+    'Arithmetic': createQuestions([
+      { q: "A train 150m long passes a pole in 15 seconds. Speed in km/h?", opts: ["36", "40", "54", "60"], ans: "A", exp: "Speed=150/15=10 m/s × 18/5 = 36 km/h.", topic: "Speed & Distance" },
+      { q: "Simple interest on Rs.1200 for 3 years is Rs.216. Rate per annum?", opts: ["5%", "6%", "7%", "8%"], ans: "B", exp: "R=(216×100)/(1200×3)=6%.", topic: "Simple Interest" },
+      { q: "A and B together complete work in 7.2 days. A alone takes 12 days. How many days for B alone?", opts: ["14", "16", "18", "20"], ans: "C", exp: "1/B = 1/7.2 - 1/12 = 5/36 - 3/36 = 2/36. B=18 days.", topic: "Work & Time" },
+      { q: "If 15% of x = 20% of y, then x:y = ?", opts: ["3:4", "4:3", "2:3", "3:2"], ans: "B", exp: "15x = 20y → x/y = 20/15 = 4:3.", topic: "Ratio & Proportion" },
+      { q: "Compound interest on Rs.5000 at 10% p.a. for 2 years?", opts: ["Rs.1000", "Rs.1050", "Rs.1100", "Rs.1025"], ans: "B", exp: "CI = 5000 × [(1.1)² - 1] = 5000 × 0.21 = Rs.1050.", topic: "Compound Interest" }
+    ], sectionName),
+    'English': createQuestions([
+      { q: "Choose the correct synonym for EPHEMERAL:", opts: ["Permanent", "Transient", "Eternal", "Everlasting"], ans: "B", exp: "Ephemeral = lasting very short time. Transient is the synonym.", topic: "Vocabulary" },
+      { q: "Identify the correctly spelled word:", opts: ["Accomodation", "Accommodation", "Acommodation", "Accomadation"], ans: "B", exp: "Accommodation has double 'c' and double 'm'.", topic: "Spelling" },
+      { q: "She _____ to the market yesterday. Choose the correct form:", opts: ["go", "goes", "went", "gone"], ans: "C", exp: "Past tense of 'go' is 'went'.", topic: "Grammar" },
+      { q: "Choose the antonym of VERBOSE:", opts: ["Wordy", "Talkative", "Concise", "Eloquent"], ans: "C", exp: "Verbose = using too many words. Antonym = Concise.", topic: "Vocabulary" },
+      { q: "Passive voice of 'She writes a letter' is:", opts: ["A letter is written by her", "A letter was written by her", "A letter has been written by her", "A letter will be written by her"], ans: "A", exp: "Present simple active → 'is written by' in passive.", topic: "Grammar" }
+    ], sectionName),
+    'GK': createQuestions([
+      { q: "Who was the first President of India?", opts: ["Jawaharlal Nehru", "Rajendra Prasad", "Sardar Patel", "B.R. Ambedkar"], ans: "B", exp: "Dr. Rajendra Prasad served as first President from 1950 to 1962.", topic: "Indian Polity" },
+      { q: "The Strait of Malacca connects which bodies of water?", opts: ["Arabian Sea and Bay of Bengal", "Pacific and Atlantic", "South China Sea and Indian Ocean", "Mediterranean and Red Sea"], ans: "C", exp: "Malacca Strait links the Andaman Sea to the South China Sea.", topic: "Geography" },
+      { q: "Which planet is known as the Red Planet?", opts: ["Venus", "Jupiter", "Saturn", "Mars"], ans: "D", exp: "Mars appears red due to iron oxide (rust) on its surface.", topic: "Science" },
+      { q: "The Battle of Plassey was fought in the year:", opts: ["1757", "1761", "1764", "1856"], ans: "A", exp: "Battle of Plassey, 1757 — British East India Company vs Nawab Siraj ud-Daulah.", topic: "History" },
+      { q: "Who invented the telephone?", opts: ["Thomas Edison", "Nikola Tesla", "Alexander Graham Bell", "Guglielmo Marconi"], ans: "C", exp: "Alexander Graham Bell patented the telephone in 1876.", topic: "Science & Technology" }
+    ], sectionName)
   };
 
-  const questions = all[sectionName] || all['Reasoning'];
-  return questions
-    .filter(q => !questionHashes.has(hashQuestion(q.question)))
-    .map((q, i) => ({
-      ...q,
-      id: `${sectionName.replace(/\s+/g, '_')}_fallback_${i}`,
-      section: sectionName
-    }));
+  const fallbackAliases = {
+    'Quantitative Aptitude': 'Arithmetic',
+    'Mathematics': 'Arithmetic',
+    'English Language': 'English',
+    'General Knowledge': 'GK',
+    'General Awareness': 'GK'
+  };
+
+  const fallbackKey = all[sectionName] ? sectionName : (fallbackAliases[sectionName] || 'Reasoning');
+  const questions = all[fallbackKey] || all['Reasoning'];
+  
+  // Filter out duplicates and return up to requestedCount
+  const filtered = questions
+    .filter(q => !questionHashes.has(hashQuestionSHA256(q.question)))
+    .slice(0, Math.max(5, requestedCount));
+
+  if (filtered.length === 0) {
+    // Return unfiltered as last resort
+    return questions.slice(0, Math.max(5, requestedCount));
+  }
+
+  return filtered;
+}
+
+// Helper to create question objects with standardized field names
+function createQuestions(items, sectionName) {
+  return items.map((item, i) => ({
+    question: item.q,
+    options: item.opts,
+    correctAnswer: item.ans,
+    explanation: item.exp,
+    topic: item.topic,
+    section: sectionName,
+    difficulty: 'Easy',
+    source: 'fallback',
+    id: `fallback_${sectionName}_${i}`
+  }));
 }

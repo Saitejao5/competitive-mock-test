@@ -1,10 +1,17 @@
 // ─────────────────────────────────────────────────────────
-// LLM ROUTER ENGINE — OpenRouter Only
+// LLM ROUTER ENGINE — OpenRouter with Exponential Backoff & Circuit Breaker
 // Handles timeout, fallback, retry per spec
 // ─────────────────────────────────────────────────────────
 
 const TIMEOUT_MS = parseInt(process.env.LLM_TIMEOUT_MS) || 10000;
 const MAX_RETRIES = parseInt(process.env.MAX_RETRIES) || 2;
+const CIRCUIT_BREAKER_THRESHOLD = 5; // Failures before circuit opens
+const CIRCUIT_BREAKER_TIMEOUT = 60000; // 1 minute
+
+// Circuit breaker state
+let failureCount = 0;
+let circuitOpen = false;
+let circuitOpenedAt = null;
 
 // ─────────────────────────────────────────────────────────
 // MAIN ROUTER — uses OpenRouter with fallback models
@@ -27,6 +34,17 @@ export async function routeLLM({ systemPrompt, userPrompt, onLog }) {
     throw new Error('No OpenRouter models configured in .env');
   }
 
+  // Check circuit breaker
+  if (circuitOpen) {
+    if (Date.now() - circuitOpenedAt > CIRCUIT_BREAKER_TIMEOUT) {
+      log(`[ROUTER] Circuit breaker reset after ${CIRCUIT_BREAKER_TIMEOUT}ms`, 'info');
+      circuitOpen = false;
+      failureCount = 0;
+    } else {
+      throw new Error(`[ROUTER] Circuit breaker OPEN (${failureCount}/${CIRCUIT_BREAKER_THRESHOLD} failures). Retry in ${Math.ceil((CIRCUIT_BREAKER_TIMEOUT - (Date.now() - circuitOpenedAt)) / 1000)}s`);
+    }
+  }
+
   for (const model of models) {
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       log(`[ROUTER → OpenRouter] Model: ${model} | Attempt: ${attempt}/${MAX_RETRIES}`, 'llm');
@@ -37,20 +55,36 @@ export async function routeLLM({ systemPrompt, userPrompt, onLog }) {
           TIMEOUT_MS,
           `OpenRouter/${model}`
         );
-        log(`[ROUTER ✓] OpenRouter/${model} responded successfully`, 'success');
+        
+        // Success: reset failure count
+        failureCount = Math.max(0, failureCount - 1);
+        log(`[ROUTER ✓] OpenRouter/${model} succeeded | Failures: ${failureCount}`, 'success');
         return { ...result, provider: 'OpenRouter', model };
       } catch (err) {
-        log(`[ROUTER ✗] OpenRouter/${model} attempt ${attempt} failed: ${err.message}`, 'error');
+        log(`[ROUTER ✗] Attempt ${attempt} failed: ${err.message}`, 'error');
+        failureCount++;
 
         if (isRateLimitError(err)) {
-          log(`[ROUTER] Rate limit on OpenRouter/${model} — switching model`, 'warn');
+          log(`[ROUTER] Rate limit detected — switching model`, 'warn');
           break; // Try next model
         }
 
+        if (isTimeoutError(err)) {
+          log(`[ROUTER] Timeout detected — ${attempt < MAX_RETRIES ? 'retrying' : 'failing'}`, 'warn');
+        }
+
         if (attempt < MAX_RETRIES) {
-          const delay = attempt * 1000;
-          log(`[ROUTER] Retrying in ${delay}ms...`, 'warn');
+          // Exponential backoff: 1s, 2s, 4s, etc.
+          const delay = Math.min(1000 * Math.pow(2, attempt - 1), 8000);
+          log(`[ROUTER] Retrying in ${delay}ms...`, 'info');
           await sleep(delay);
+        }
+
+        // Open circuit breaker if too many failures
+        if (failureCount >= CIRCUIT_BREAKER_THRESHOLD && !circuitOpen) {
+          circuitOpen = true;
+          circuitOpenedAt = Date.now();
+          log(`[ROUTER] ⚠️ Circuit breaker OPENED (${failureCount} failures)`, 'error');
         }
       }
     }
@@ -58,7 +92,7 @@ export async function routeLLM({ systemPrompt, userPrompt, onLog }) {
     log(`[ROUTER] Model ${model} exhausted — trying next model`, 'warn');
   }
 
-  throw new Error('All OpenRouter models failed. Please check your API key and try again.');
+  throw new Error('All OpenRouter models failed. Circuit breaker may be open.');
 }
 
 // ─────────────────────────────────────────────────────────
@@ -127,6 +161,16 @@ function isRateLimitError(err) {
   return err.statusCode === 429 || err.message.includes('rate_limit') || err.message.includes('429');
 }
 
+function isTimeoutError(err) {
+  return err.message.includes('Timeout') || err.message.includes('timeout') || err.code === 'ETIMEDOUT';
+}
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Export circuit breaker reset for testing
+export function resetCircuitBreaker() {
+  circuitOpen = false;
+  failureCount = 0;
 }
